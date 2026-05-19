@@ -1,8 +1,8 @@
 opencv-python
-mediapipe
-streamlit
+mediapipe==0.10.9
 numpy
 pandas
 scikit-learn
 pillow
-tensorflow
+streamlit
+protobuf==3.20.3
