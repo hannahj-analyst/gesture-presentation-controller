@@ -23,6 +23,7 @@ A computer vision web application that controls presentation slides using hand g
 ✅ Swipe detection  
 ✅ Slide controller  
 ✅ Gesture-controlled slide navigation  
+✅ Training pipeline scaffold for HaGRID landmark classification  
 
 ## How to Run
 
@@ -43,3 +44,7 @@ python app/gesture_slide_controller.py
 - Swipe right → next slide
 - Swipe left → previous slide
 - q → quit
+
+## Training
+
+See [training/README.md](training/README.md) for the HaGRID preprocessing and TF.js export workflow.
