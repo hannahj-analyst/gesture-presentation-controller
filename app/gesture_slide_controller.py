@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import mediapipe as mp
+from pathlib import Path
 
 # Allow importing from parent folder
 sys.path.append(
@@ -14,15 +15,26 @@ sys.path.append(
 from utils.slide_controller import SlideController
 
 
-# MediaPipe setup
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+MODEL_PATH = Path(__file__).resolve().parent.parent / "training" / "models" / "hand_landmarker.task"
 
-hands = mp_hands.Hands(
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+RunningMode = mp.tasks.vision.RunningMode
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(f"Hand Landmarker model not found: {MODEL_PATH}")
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+    running_mode=RunningMode.IMAGE,
+    num_hands=1,
+    min_hand_detection_confidence=0.7,
+    min_hand_presence_confidence=0.7,
+    min_tracking_confidence=0.7,
 )
+
+hands = HandLandmarker.create_from_options(options)
 
 # Webcam setup
 cap = cv2.VideoCapture(0)
@@ -55,7 +67,8 @@ while True:
     height, width, _ = frame.shape
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_frame)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    results = hands.detect(mp_image)
 
     # Get current slide
     slide = controller.get_current_slide()
@@ -87,14 +100,8 @@ while True:
         2
     )
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-
-            mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS
-            )
+    if results.hand_landmarks:
+        for hand_landmarks in results.hand_landmarks:
 
             wrist = hand_landmarks.landmark[0]
             current_x = int(wrist.x * width)
@@ -160,3 +167,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+hands.close()

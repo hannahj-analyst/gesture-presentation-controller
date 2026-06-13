@@ -16,6 +16,9 @@ from training.constants import (
 )
 
 
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+
+
 def normalize_landmarks(
     raw_landmarks: np.ndarray,
     scale: bool = False,
@@ -39,7 +42,7 @@ def normalize_landmarks(
 
 def extract_landmark_features(
     image_path: Path,
-    hands,
+    hand_landmarker,
     scale: bool = False,
 ) -> np.ndarray | None:
     image = cv2.imread(str(image_path))
@@ -48,16 +51,17 @@ def extract_landmark_features(
         return None
 
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_image)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+    results = hand_landmarker.detect(mp_image)
 
-    if not results.multi_hand_landmarks:
+    if not results.hand_landmarks:
         return None
 
-    hand_landmarks = results.multi_hand_landmarks[0]
+    hand_landmarks = results.hand_landmarks[0]
     raw_landmarks = np.array(
         [
             (landmark.x, landmark.y, landmark.z)
-            for landmark in hand_landmarks.landmark
+            for landmark in hand_landmarks
         ],
         dtype=np.float32,
     )
@@ -88,29 +92,48 @@ def build_landmark_dataframe(
     dataset_root: Path,
     labels: Sequence[str] = DEFAULT_LABELS,
     scale: bool = False,
+    model_path: Path | None = None,
     min_detection_confidence: float = 0.7,
+    min_hand_presence_confidence: float = 0.7,
     min_tracking_confidence: float = 0.7,
 ) -> pd.DataFrame:
     root = Path(dataset_root)
+    task_model_path = Path(model_path) if model_path is not None else DEFAULT_MODEL_PATH
 
     if not root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {root}")
 
-    hands_api = mp.solutions.hands
-    hands = hands_api.Hands(
-        static_image_mode=True,
-        max_num_hands=1,
-        min_detection_confidence=min_detection_confidence,
+    if not task_model_path.exists():
+        raise FileNotFoundError(
+            f"Hand Landmarker model does not exist: {task_model_path}"
+        )
+
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(task_model_path)),
+        running_mode=RunningMode.IMAGE,
+        num_hands=1,
+        min_hand_detection_confidence=min_detection_confidence,
+        min_hand_presence_confidence=min_hand_presence_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
 
-    records: list[dict[str, object]] = []
+    from tqdm import tqdm
 
-    try:
-        for label, image_path in iter_labeled_images(root, labels=labels):
+    records: list[dict[str, object]] = []
+    labeled_images = list(iter_labeled_images(root, labels=labels))
+
+    with HandLandmarker.create_from_options(options) as hand_landmarker:
+        progress = tqdm(labeled_images, desc="Extracting landmarks", unit="img")
+        for label, image_path in progress:
+            progress.set_postfix(label=label)
             features = extract_landmark_features(
                 image_path=image_path,
-                hands=hands,
+                hand_landmarker=hand_landmarker,
                 scale=scale,
             )
 
@@ -129,8 +152,6 @@ def build_landmark_dataframe(
                 }
             )
             records.append(record)
-    finally:
-        hands.close()
 
     if not records:
         raise ValueError(
