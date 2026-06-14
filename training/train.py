@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -48,7 +49,20 @@ def save_json(path: Path, payload: object) -> None:
 
 
 def export_tfjs_model(model, output_dir: Path) -> None:
+    import types
+
+    if "object" not in np.__dict__:
+        np.object = object  # type: ignore[attr-defined]
+    if "bool" not in np.__dict__:
+        np.bool = bool  # type: ignore[attr-defined]
+
+    if "tensorflow_hub" not in sys.modules:
+        sys.modules["tensorflow_hub"] = types.ModuleType("tensorflow_hub")
+
     import tensorflowjs as tfjs
+    from tensorflowjs.converters import keras_h5_conversion
+
+    keras_h5_conversion._check_version = lambda h5file: None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tfjs.converters.save_keras_model(model, str(output_dir))
@@ -129,6 +143,24 @@ def parse_args() -> argparse.Namespace:
         default=0.7,
         help="MediaPipe Hands tracking confidence for preprocessing.",
     )
+    parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=None,
+        help="Number of CPU worker processes to use when extracting landmarks. Defaults to logical cores minus one.",
+    )
+    parser.add_argument(
+        "--tf-intra-op-threads",
+        type=int,
+        default=None,
+        help="TensorFlow intra-op thread count. Defaults to logical cores minus one.",
+    )
+    parser.add_argument(
+        "--tf-inter-op-threads",
+        type=int,
+        default=None,
+        help="TensorFlow inter-op thread count. Defaults to 2.",
+    )
 
     return parser.parse_args()
 
@@ -184,6 +216,23 @@ def split_dataset(
 def main() -> None:
     args = parse_args()
     label_order = tuple(args.labels) if args.labels else DEFAULT_LABELS
+    logical_cpus = os.cpu_count() or 1
+    default_cpu_workers = max(1, min(8, logical_cpus - 1))
+    preprocess_workers = (
+        args.preprocess_workers
+        if args.preprocess_workers is not None
+        else default_cpu_workers
+    )
+    tf_intra_op_threads = (
+        args.tf_intra_op_threads
+        if args.tf_intra_op_threads is not None
+        else default_cpu_workers
+    )
+    tf_inter_op_threads = (
+        args.tf_inter_op_threads
+        if args.tf_inter_op_threads is not None
+        else 2
+    )
 
     output_dir = args.output_dir.expanduser().resolve()
     tfjs_dir = output_dir / "tfjs_model"
@@ -195,6 +244,7 @@ def main() -> None:
         scale=args.scale,
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
+        workers=preprocess_workers,
     )
 
     dataset = dataset[dataset["label"].isin(label_order)].copy()
@@ -230,7 +280,17 @@ def main() -> None:
         seed=args.seed,
     )
 
+    os.environ.setdefault("OMP_NUM_THREADS", str(tf_intra_op_threads))
+    os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(tf_intra_op_threads))
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", str(tf_inter_op_threads))
+
     import tensorflow as tf
+
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(tf_intra_op_threads)
+        tf.config.threading.set_inter_op_parallelism_threads(tf_inter_op_threads)
+    except RuntimeError:
+        pass
 
     tf.random.set_seed(args.seed)
 

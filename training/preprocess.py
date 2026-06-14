@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -17,6 +19,81 @@ from training.constants import (
 
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+
+
+_WORKER_LANDMARKER = None
+_WORKER_SCALE = False
+
+
+def _make_hand_landmarker_options(
+    task_model_path: Path,
+    min_detection_confidence: float,
+    min_hand_presence_confidence: float,
+    min_tracking_confidence: float,
+):
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
+
+    return HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(task_model_path)),
+        running_mode=RunningMode.IMAGE,
+        num_hands=1,
+        min_hand_detection_confidence=min_detection_confidence,
+        min_hand_presence_confidence=min_hand_presence_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+    )
+
+
+def _configure_worker(
+    task_model_path: Path,
+    scale: bool,
+    min_detection_confidence: float,
+    min_hand_presence_confidence: float,
+    min_tracking_confidence: float,
+) -> None:
+    global _WORKER_LANDMARKER
+    global _WORKER_SCALE
+
+    _WORKER_SCALE = scale
+
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    _WORKER_LANDMARKER = HandLandmarker.create_from_options(
+        _make_hand_landmarker_options(
+            task_model_path=Path(task_model_path),
+            min_detection_confidence=min_detection_confidence,
+            min_hand_presence_confidence=min_hand_presence_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
+    )
+
+
+def _extract_labeled_image_worker(item: tuple[str, Path]) -> dict[str, object] | None:
+    if _WORKER_LANDMARKER is None:
+        raise RuntimeError("Worker landmarker was not initialized.")
+
+    label, image_path = item
+    features = extract_landmark_features(
+        image_path=image_path,
+        hand_landmarker=_WORKER_LANDMARKER,
+        scale=_WORKER_SCALE,
+    )
+
+    if features is None:
+        return None
+
+    record: dict[str, object] = {
+        "label": label,
+        "source_path": str(image_path),
+    }
+
+    record.update(
+        {
+            column: float(value)
+            for column, value in zip(FEATURE_COLUMNS, features)
+        }
+    )
+    return record
 
 
 def normalize_landmarks(
@@ -96,6 +173,7 @@ def build_landmark_dataframe(
     min_detection_confidence: float = 0.7,
     min_hand_presence_confidence: float = 0.7,
     min_tracking_confidence: float = 0.7,
+    workers: int | None = None,
 ) -> pd.DataFrame:
     root = Path(dataset_root)
     task_model_path = Path(model_path) if model_path is not None else DEFAULT_MODEL_PATH
@@ -108,50 +186,77 @@ def build_landmark_dataframe(
             f"Hand Landmarker model does not exist: {task_model_path}"
         )
 
-    BaseOptions = mp.tasks.BaseOptions
-    HandLandmarker = mp.tasks.vision.HandLandmarker
-    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-    RunningMode = mp.tasks.vision.RunningMode
-
-    options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(task_model_path)),
-        running_mode=RunningMode.IMAGE,
-        num_hands=1,
-        min_hand_detection_confidence=min_detection_confidence,
-        min_hand_presence_confidence=min_hand_presence_confidence,
-        min_tracking_confidence=min_tracking_confidence,
-    )
-
     from tqdm import tqdm
 
     records: list[dict[str, object]] = []
     labeled_images = list(iter_labeled_images(root, labels=labels))
+    logical_cpus = os.cpu_count() or 1
+    default_workers = max(1, min(8, logical_cpus - 1))
+    worker_count = workers if workers is not None else default_workers
 
-    with HandLandmarker.create_from_options(options) as hand_landmarker:
-        progress = tqdm(labeled_images, desc="Extracting landmarks", unit="img")
-        for label, image_path in progress:
-            progress.set_postfix(label=label)
-            features = extract_landmark_features(
-                image_path=image_path,
-                hand_landmarker=hand_landmarker,
-                scale=scale,
-            )
+    if worker_count <= 1:
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        options = _make_hand_landmarker_options(
+            task_model_path=task_model_path,
+            min_detection_confidence=min_detection_confidence,
+            min_hand_presence_confidence=min_hand_presence_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
 
-            if features is None:
-                continue
+        with HandLandmarker.create_from_options(options) as hand_landmarker:
+            progress = tqdm(labeled_images, desc="Extracting landmarks", unit="img")
+            for label, image_path in progress:
+                progress.set_postfix(label=label)
+                features = extract_landmark_features(
+                    image_path=image_path,
+                    hand_landmarker=hand_landmarker,
+                    scale=scale,
+                )
 
-            record: dict[str, object] = {
-                "label": label,
-                "source_path": str(image_path),
-            }
+                if features is None:
+                    continue
 
-            record.update(
-                {
-                    column: float(value)
-                    for column, value in zip(FEATURE_COLUMNS, features)
+                record: dict[str, object] = {
+                    "label": label,
+                    "source_path": str(image_path),
                 }
-            )
-            records.append(record)
+
+                record.update(
+                    {
+                        column: float(value)
+                        for column, value in zip(FEATURE_COLUMNS, features)
+                    }
+                )
+                records.append(record)
+    else:
+        from multiprocessing import get_context
+
+        progress = tqdm(total=len(labeled_images), desc="Extracting landmarks", unit="img")
+
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=get_context("spawn"),
+            initializer=_configure_worker,
+            initargs=(
+                task_model_path,
+                scale,
+                min_detection_confidence,
+                min_hand_presence_confidence,
+                min_tracking_confidence,
+            ),
+        ) as executor:
+            for record in executor.map(
+                _extract_labeled_image_worker,
+                labeled_images,
+                chunksize=max(1, len(labeled_images) // (worker_count * 4)),
+            ):
+                progress.update(1)
+                if record is None:
+                    continue
+
+                records.append(record)
+
+        progress.close()
 
     if not records:
         raise ValueError(
