@@ -155,6 +155,16 @@ while True:
         2
     )
 
+    cv2.putText(
+        slide,
+        f"Action: {last_action_text}",
+        (30, 150),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 0, 255),
+        2
+    )
+
     if results.hand_landmarks:
         for hand_landmarks in results.hand_landmarks:
 
