@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Gesture training artifacts
+training/artifacts/
+training/cache/
+training/data/
+
