@@ -2,6 +2,8 @@ opencv-python
 mediapipe==0.10.30
 numpy
 pandas
+matplotlib
+seaborn
 scikit-learn
 pillow
 streamlit
