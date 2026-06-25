@@ -1,4 +1,4 @@
-# main.py  (full replacement — only the sections that changed are annotated)
+# main.py
 
 import cv2
 import time
@@ -33,29 +33,48 @@ SWIPE_MIN_STEP         = 6
 SWIPE_DIRECTION_RATIO  = 0.1
 
 # ── Pinch thresholds (normalised wrist→middle-mcp distance units) ─────────
-PINCH_CLOSE_THRESH  = 0.07   # below this  → pinched
-PINCH_OPEN_THRESH   = 0.10   # above this  → open  (hysteresis gap)
+PINCH_CLOSE_THRESH  = 0.2
+PINCH_OPEN_THRESH   = 0.3
 
 # ── Zoom constants ────────────────────────────────────────────────────────
-ZOOM_SENSITIVITY    = 4.0    # multiplier: how fast distance→zoom
+ZOOM_SENSITIVITY    = 2.0
 ZOOM_MIN            = 1.0
-ZOOM_MAX            = 5.0
+ZOOM_MAX            = 3.0
 
-# ── Gesture → mode mapping  (CHANGED: ok→DRAWING, peace→ZOOM) ────────────
+# ── Cursor smoothing & sensitivity ───────────────────────────────────────
+# CURSOR_ALPHA: EMA weight applied to each new raw sample.
+#   Lower  → heavier smoothing, more lag   (try 0.12–0.18 for max stability)
+#   Higher → snappier tracking, more jitter (approach 1.0 to disable EMA)
+CURSOR_ALPHA = 0.25
+
+# CURSOR_SENSITIVITY: multiplier applied to the cursor's displacement from the
+# screen centre.  1.0 = cursor matches hand 1-to-1.  1.8 means a hand movement
+# of N px from centre registers as 1.8 × N px of cursor travel, so the cursor
+# reaches slide edges with smaller hand movements.
+CURSOR_SENSITIVITY = 1.8
+
+# ── Gesture → mode mapping ────────────────────────────────────────────────
 MODE_BY_LABEL = {
+    "one":   "POINTER",
     "ok":    "DRAWING",
     "peace": "ZOOM",
     "stop":  "CLEAR",
-    "fist":  "EXIT",      
+    "fist":  "EXIT",
 }
 EXIT_GESTURE = "fist"
 
+MODE_EXIT_GESTURE_BY_MODE = {
+    "DRAWING": "fist",
+    "ZOOM":    "fist",
+    "POINTER": "fist",
+}
+
 # ─────────────────────────────────────────────────────────────────────────
-BaseOptions       = mp.tasks.BaseOptions
-HandLandmarker    = mp.tasks.vision.HandLandmarker
+BaseOptions           = mp.tasks.BaseOptions
+HandLandmarker        = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-RunningMode       = mp.tasks.vision.RunningMode
-HAND_CONNECTIONS  = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
+RunningMode           = mp.tasks.vision.RunningMode
+HAND_CONNECTIONS      = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
 
 for p in (HAND_LANDMARKER_PATH, GESTURE_MODEL_PATH, LABELS_PATH):
     if not p.exists():
@@ -113,23 +132,22 @@ def draw_hand_landmarks(frame, hand_landmarks, width, height):
         cv2.circle(frame, (int(lm.x * width), int(lm.y * height)), 4, (0, 255, 0), -1)
 
 
-# ── Pinch helper ──────────────────────────────────────────────────────────
 def get_pinch_distance(hand_landmarks) -> float:
     """
-    Return thumb-tip ↔ index-tip distance, normalised by the
-    wrist→middle-MCP span so it is scale-invariant.
-    Landmark indices: 4=thumb tip, 8=index tip, 0=wrist, 9=middle MCP.
+    Return thumb-tip ↔ index-tip distance normalised by wrist→middle-MCP span.
+    Scale-invariant.  Indices: 4=thumb tip, 8=index tip, 0=wrist, 9=middle MCP.
     """
-    thumb  = np.array([hand_landmarks[4].x,  hand_landmarks[4].y])
-    index  = np.array([hand_landmarks[8].x,  hand_landmarks[8].y])
-    wrist  = np.array([hand_landmarks[0].x,  hand_landmarks[0].y])
-    mid    = np.array([hand_landmarks[9].x,  hand_landmarks[9].y])
-    ref    = np.linalg.norm(mid - wrist) or 1e-6
+    thumb = np.array([hand_landmarks[4].x, hand_landmarks[4].y])
+    index = np.array([hand_landmarks[8].x, hand_landmarks[8].y])
+    wrist = np.array([hand_landmarks[0].x, hand_landmarks[0].y])
+    mid   = np.array([hand_landmarks[9].x, hand_landmarks[9].y])
+    ref   = np.linalg.norm(mid - wrist) or 1e-6
     return float(np.linalg.norm(index - thumb) / ref)
 
 
 def get_index_tip_px(hand_landmarks, width: int, height: int) -> tuple[int, int]:
-    lm = hand_landmarks[8]          # index fingertip
+    """Raw (un-smoothed) index fingertip pixel position."""
+    lm = hand_landmarks[8]
     return int(lm.x * width), int(lm.y * height)
 
 
@@ -137,21 +155,16 @@ def get_index_tip_px(hand_landmarks, width: int, height: int) -> tuple[int, int]
 def apply_zoom(slide: np.ndarray,
                zoom_level: float,
                cursor_px: tuple[int, int]) -> np.ndarray:
-    """
-    Zoom the slide image around `cursor_px` by `zoom_level`.
-    Returns a new array the same size as `slide`.
-    """
+    """Zoom the slide image around cursor_px by zoom_level."""
     if zoom_level <= 1.0:
         return slide
 
     h, w = slide.shape[:2]
     cx, cy = cursor_px
 
-    # Crop size (shrinks as zoom grows)
     crop_w = int(w / zoom_level)
     crop_h = int(h / zoom_level)
 
-    # Keep crop centred on cursor, clamped inside frame
     x1 = max(0, min(cx - crop_w // 2, w - crop_w))
     y1 = max(0, min(cy - crop_h // 2, h - crop_h))
     x2 = x1 + crop_w
@@ -159,6 +172,73 @@ def apply_zoom(slide: np.ndarray,
 
     cropped = slide[y1:y2, x1:x2]
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+# ── Cursor smoother ───────────────────────────────────────────────────────
+class CursorSmoother:
+    """
+    Exponential moving average (EMA) + sensitivity amplification for the
+    index-fingertip cursor.
+
+    Call  update()  once per frame when a hand is detected.
+    Read  .px       anywhere that needs the smoothed cursor position.
+    Call  reset()   when no hand is visible so the smoother doesn't drift
+                    toward stale coordinates on the next detection.
+
+    Tuning
+    ------
+    CURSOR_ALPHA       – EMA weight per frame (module-level constant).
+                         0.12–0.18  very smooth, noticeable lag
+                         0.25       default: smooth but still responsive
+                         0.4+       snappier, some jitter returns
+    CURSOR_SENSITIVITY – displacement amplifier from screen centre.
+                         1.0  cursor matches hand 1-to-1
+                         1.8  default: reach edges with smaller hand movements
+                         2.5  very sensitive (good for large slides / small gestures)
+    """
+
+    def __init__(self) -> None:
+        self._sx: float | None = None
+        self._sy: float | None = None
+        self._last: tuple[int, int] = (0, 0)
+
+    def update(self, raw_x: int, raw_y: int, width: int, height: int) -> tuple[int, int]:
+        """
+        Feed a new raw fingertip position.  Returns the smoothed,
+        amplified, bounds-clamped pixel coordinate.
+        """
+        if self._sx is None:
+            # First detection this run: seed with raw position to avoid
+            # a sudden jump from (0,0) to wherever the hand appears.
+            self._sx = float(raw_x)
+            self._sy = float(raw_y)
+        else:
+            a = CURSOR_ALPHA
+            self._sx = a * raw_x + (1.0 - a) * self._sx
+            self._sy = a * raw_y + (1.0 - a) * self._sy
+
+        # Amplify displacement from screen centre
+        cx, cy = width / 2.0, height / 2.0
+        sx = cx + (self._sx - cx) * CURSOR_SENSITIVITY
+        sy = cy + (self._sy - cy) * CURSOR_SENSITIVITY
+
+        # Clamp to valid frame bounds
+        self._last = (
+            int(max(0.0, min(sx, width  - 1))),
+            int(max(0.0, min(sy, height - 1))),
+        )
+        return self._last
+
+    @property
+    def px(self) -> tuple[int, int]:
+        """Last computed smoothed cursor position (or (0,0) before first update)."""
+        return self._last
+
+    def reset(self) -> None:
+        """Discard smoothing state.  Call when the hand disappears."""
+        self._sx   = None
+        self._sy   = None
+        self._last = (0, 0)
 
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────
@@ -176,7 +256,7 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-controller             = SlideController()
+controller                                      = SlideController()
 slide_annotation_states: dict[int, PointerDrawingState] = {}
 
 # Gesture state
@@ -192,12 +272,16 @@ last_action_text           = "No action yet"
 last_prediction_text       = "No gesture yet"
 last_prediction_confidence = 0.0
 
-# Pinch state (hysteresis)
+# Pinch state (hysteresis) + previous-frame value for edge detection
 is_pinched   = False
+was_pinched  = False   # tracks the previous frame's pinch state
 
 # Zoom state
-zoom_level        = 1.0          # current zoom multiplier
-zoom_ref_distance = None         # pinch distance captured when zoom started
+zoom_level        = 1.0
+zoom_ref_distance = None
+
+# Cursor smoother — single shared instance updated once per frame
+smoother = CursorSmoother()
 
 
 def get_slide_state(idx: int) -> PointerDrawingState:
@@ -219,7 +303,7 @@ while True:
     swipe_remaining   = SWIPE_COOLDOWN - time_since_swipe
     swipe_on_cooldown = swipe_remaining > 0
 
-    frame     = cv2.flip(frame, 1)
+    frame            = cv2.flip(frame, 1)
     height, width, _ = frame.shape
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -241,16 +325,20 @@ while True:
     cv2.putText(slide, f"Action: {last_action_text}",
                 (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    if active_mode != "NAVIGATION":
-        exit_g          = MODE_EXIT_GESTURE_BY_MODE.get(active_mode, "")
-        swipe_txt       = f"Swipe: LOCKED ({active_mode}) | hold {exit_g} 3s to exit"
-        swipe_clr       = (0, 140, 255)
+    # Swipe status line — context-aware for DRAWING mode
+    if active_mode == "DRAWING":
+        swipe_txt = "Swipe: ← undo  → redo"
+        swipe_clr = (0, 200, 140)
+    elif active_mode != "NAVIGATION":
+        exit_g    = MODE_EXIT_GESTURE_BY_MODE.get(active_mode, "")
+        swipe_txt = f"Swipe: LOCKED ({active_mode}) | hold {exit_g} 3s to exit"
+        swipe_clr = (0, 140, 255)
     elif swipe_on_cooldown:
-        swipe_txt       = f"Swipe: COOLDOWN ({swipe_remaining:.1f}s)"
-        swipe_clr       = (0, 0, 255)
+        swipe_txt = f"Swipe: COOLDOWN ({swipe_remaining:.1f}s)"
+        swipe_clr = (0, 0, 255)
     else:
-        swipe_txt       = "Swipe: READY"
-        swipe_clr       = (0, 255, 0)
+        swipe_txt = "Swipe: READY"
+        swipe_clr = (0, 255, 0)
 
     cv2.putText(slide, swipe_txt,
                 (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, swipe_clr, 2)
@@ -265,14 +353,17 @@ while True:
     hand_landmarks = results.hand_landmarks[0] if results.hand_landmarks else None
 
     if hand_landmarks:
-        wrist      = hand_landmarks[0]
-        current_x  = int(wrist.x * width)
+        wrist     = hand_landmarks[0]
+        current_x = int(wrist.x * width)
         x_positions.append(current_x)
         if len(x_positions) > SWIPE_HISTORY_LENGTH:
             x_positions.pop(0)
 
         # ── Pinch detection (hysteresis) ──────────────────────────────────
-        pinch_dist = get_pinch_distance(hand_landmarks)
+        # was_pinched captures the state from the end of the previous frame
+        # so we can detect the falling edge (pinch release = stroke commit).
+        was_pinched = is_pinched
+        pinch_dist  = get_pinch_distance(hand_landmarks)
         if is_pinched:
             if pinch_dist > PINCH_OPEN_THRESH:
                 is_pinched = False
@@ -280,16 +371,25 @@ while True:
             if pinch_dist < PINCH_CLOSE_THRESH:
                 is_pinched = True
 
-        cursor_px = get_index_tip_px(hand_landmarks, width, height)
+        # ── Commit stroke on pinch release (DRAWING mode only) ────────────
+        # The falling edge (was_pinched True → is_pinched False) marks the
+        # end of one continuous stroke.  We snapshot the canvas here so that
+        # a subsequent swipe-left can undo exactly that stroke.
+        if active_mode == "DRAWING" and was_pinched and not is_pinched:
+            slide_state.commit_stroke()
+
+        # ── Smooth & amplify cursor (single update per frame) ─────────────
+        raw_x, raw_y = get_index_tip_px(hand_landmarks, width, height)
+        cursor_px    = smoother.update(raw_x, raw_y, width, height)
 
         # ── Gesture prediction (throttled) ────────────────────────────────
         if current_time - last_prediction_time > PREDICTION_COOLDOWN:
             try:
                 predicted_label, confidence = predict_gesture(hand_landmarks)
             except Exception as exc:
-                last_action_text       = f"Model error: {exc}"
-                predicted_label        = last_prediction_text
-                confidence             = last_prediction_confidence
+                last_action_text  = f"Model error: {exc}"
+                predicted_label   = last_prediction_text
+                confidence        = last_prediction_confidence
             else:
                 last_prediction_text       = predicted_label
                 last_prediction_confidence = confidence
@@ -299,31 +399,61 @@ while True:
             predicted_label = last_prediction_text
             confidence      = last_prediction_confidence
 
-        # ── Swipe (NAVIGATION only) ───────────────────────────────────────
+        # ── Swipe detection ───────────────────────────────────────────────
+        # NAVIGATION mode : left/right → previous/next slide  (unchanged)
+        # DRAWING mode    : left → undo last stroke, right → redo
+        # All other modes : swipe ignored
         swipe_triggered = False
-        if (active_mode == "NAVIGATION"
+        if (active_mode in {"NAVIGATION", "DRAWING"}
                 and len(x_positions) == SWIPE_HISTORY_LENGTH
                 and current_time - last_swipe_time > SWIPE_COOLDOWN):
 
             swipe_dir = detect_swipe(x_positions)
-            if swipe_dir == "right":
-                controller.next_slide()
-                last_action_text = "Swipe Right -> Next Slide"
-                last_swipe_time  = current_time
-                x_positions.clear()
-                swipe_triggered  = True
-            elif swipe_dir == "left":
-                controller.previous_slide()
-                last_action_text = "Swipe Left -> Previous Slide"
-                last_swipe_time  = current_time
-                x_positions.clear()
-                swipe_triggered  = True
+
+            if active_mode == "NAVIGATION":
+                if swipe_dir == "right":
+                    controller.next_slide()
+                    last_action_text = "Swipe Right -> Next Slide"
+                    last_swipe_time  = current_time
+                    x_positions.clear()
+                    swipe_triggered  = True
+                elif swipe_dir == "left":
+                    controller.previous_slide()
+                    last_action_text = "Swipe Left -> Previous Slide"
+                    last_swipe_time  = current_time
+                    x_positions.clear()
+                    swipe_triggered  = True
+
+            elif active_mode == "DRAWING":
+                if swipe_dir == "left":
+                    # Undo: if a stroke is currently in progress (pinch held),
+                    # release it cleanly before undoing so we don't leave a
+                    # half-drawn stroke that undo can't account for.
+                    if is_pinched:
+                        slide_state.commit_stroke()
+                        is_pinched  = False
+                        was_pinched = False
+                    if slide_state.undo():
+                        last_action_text = f"Undo  (remaining: {len(slide_state.undo_stack)})"
+                    else:
+                        last_action_text = "Nothing to undo"
+                    last_swipe_time = current_time
+                    x_positions.clear()
+                    swipe_triggered = True
+                elif swipe_dir == "right":
+                    if slide_state.redo():
+                        last_action_text = f"Redo  (remaining: {len(slide_state.redo_stack)})"
+                    else:
+                        last_action_text = "Nothing to redo"
+                    last_swipe_time = current_time
+                    x_positions.clear()
+                    swipe_triggered = True
 
         # ── Mode-hold detection ───────────────────────────────────────────
-        stable_label     = (predicted_label
-                            if confidence >= GESTURE_MIN_CONFIDENCE
-                               and predicted_label in MODE_BY_LABEL
-                            else None)
+        stable_label = (predicted_label
+                        if confidence >= GESTURE_MIN_CONFIDENCE
+                           and predicted_label in MODE_BY_LABEL
+                        else None)
         mode_action_triggered = False
 
         if stable_label is None:
@@ -346,9 +476,7 @@ while True:
                         last_action_text  = "Mode -> NAVIGATION"
                         zoom_level        = 1.0
                         zoom_ref_distance = None
-                    # (if already in NAVIGATION, fist is a no-op — just eats the hold)
 
-                # ── Normal mode entry/action (only reached for non-fist gestures) ──
                 elif active_mode == "NAVIGATION":
                     if target_mode == "CLEAR":
                         clear_canvas(state=slide_state)
@@ -361,7 +489,6 @@ while True:
                             zoom_ref_distance = None
 
                 else:
-                    # Already in a non-NAVIGATION mode; only CLEAR is actionable here
                     if target_mode == "CLEAR":
                         clear_canvas(state=slide_state)
                         last_action_text = "Cleared current slide annotations"
@@ -376,31 +503,26 @@ while True:
         if active_mode == "DRAWING" and not swipe_triggered:
             slide = pointer_drawing_overlay(
                 slide, hand_landmarks,
-                "DRAWING" if is_pinched else "POINTER",   # POINTER = cursor only
+                "DRAWING" if is_pinched else "POINTER",
                 slide_state,
+                cursor_px=cursor_px,
             )
 
         # ── ZOOM mode ─────────────────────────────────────────────────────
         elif active_mode == "ZOOM" and not swipe_triggered:
             if is_pinched:
-                # Pinch = move cursor, freeze zoom
-                zoom_ref_distance = None          # reset reference so zoom
-                                                  # resumes cleanly on release
-                # Draw a small cursor circle to show position
+                zoom_ref_distance = None
                 cv2.circle(slide, cursor_px, 10, (0, 220, 255), 2)
             else:
-                # Open hand = adjust zoom by thumb-index spread
                 if zoom_ref_distance is None:
-                    zoom_ref_distance = pinch_dist or 0.15   # baseline
+                    zoom_ref_distance = pinch_dist or 0.15
 
-                # Ratio of current spread vs baseline
                 spread_ratio = pinch_dist / (zoom_ref_distance or 1e-6)
                 zoom_level   = float(np.clip(
                     spread_ratio * ZOOM_SENSITIVITY,
-                    ZOOM_MIN, ZOOM_MAX
+                    ZOOM_MIN, ZOOM_MAX,
                 ))
 
-                # Map cursor from webcam space → slide space
                 slide_h, slide_w = slide.shape[:2]
                 slide_cursor = (
                     int(cursor_px[0] / width  * slide_w),
@@ -408,13 +530,15 @@ while True:
                 )
                 slide = apply_zoom(slide, zoom_level, slide_cursor)
 
-                # Crosshair in zoom mode
                 cv2.circle(slide, (slide_w // 2, slide_h // 2),
                            12, (0, 220, 255), 2)
 
-        # ── NAVIGATION mode: original pointer overlay (unchanged) ─────────
+        # ── POINTER / NAVIGATION mode ─────────────────────────────────────
         elif active_mode == "POINTER" and not swipe_triggered:
-            slide = pointer_drawing_overlay(slide, hand_landmarks, "POINTER", slide_state)
+            slide = pointer_drawing_overlay(
+                slide, hand_landmarks, "POINTER", slide_state,
+                cursor_px=cursor_px,
+            )
 
         if (not swipe_triggered
                 and not mode_action_triggered
@@ -422,13 +546,15 @@ while True:
             last_action_text = f"Predicted: {predicted_label}"
 
     else:
-        # No hand visible
+        # No hand visible — reset all per-hand state
         x_positions.clear()
         held_label        = None
         held_label_start  = 0.0
         held_label_fired  = False
         is_pinched        = False
+        was_pinched       = False
         zoom_ref_distance = None
+        smoother.reset()
 
     # ── Persistent canvas composite (drawing mode, no hand) ───────────────
     if (slide_state.canvas is not None
