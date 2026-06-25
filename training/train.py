@@ -376,12 +376,31 @@ def main() -> None:
         },
     )
 
-    confusion_frame = pd.DataFrame(
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
         confusion,
-        index=[f"true_{label}" for label in label_order],
-        columns=[f"pred_{label}" for label in label_order],
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=list(label_order),
+        yticklabels=list(label_order),
+        linewidths=0.5,
+        linecolor="white",
+        ax=ax,
     )
-    confusion_frame.to_csv(output_dir / "confusion_matrix.csv")
+    ax.set_xlabel("Predicted label", labelpad=10)
+    ax.set_ylabel("True label", labelpad=10)
+    ax.set_title(f"Confusion Matrix  (test acc {test_accuracy:.2%})", pad=14)
+    ax.tick_params(axis="x", rotation=30)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+
+    confusion_png = output_dir / "confusion_matrix.png"
+    fig.savefig(confusion_png, dpi=150)
+    plt.close(fig)
 
     print(f"Saved processed landmarks to {dataset_csv}")
     print(f"Saved Keras model to {model_path}")
