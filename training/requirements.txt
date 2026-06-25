@@ -1,3 +1,2 @@
 -r ../requirements.txt
 tensorflow>=2.16,<3
-tensorflowjs>=4.22,<5

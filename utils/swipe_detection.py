@@ -62,7 +62,7 @@ while True:
         for hand_landmarks in results.hand_landmarks:
 
             # Use wrist landmark
-            wrist = hand_landmarks.landmark[0]
+            wrist = hand_landmarks[0]
 
             current_x = int(wrist.x * width)
             current_y = int(wrist.y * height)
