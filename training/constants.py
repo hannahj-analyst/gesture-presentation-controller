@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-DEFAULT_LABELS = ("one", "peace", "stop", "ok")
+DEFAULT_LABELS = ("one", "peace", "stop", "ok", "fist")
 NUM_LANDMARKS = 21
 FEATURES_PER_LANDMARK = 3
 FEATURE_DIMENSION = NUM_LANDMARKS * FEATURES_PER_LANDMARK
