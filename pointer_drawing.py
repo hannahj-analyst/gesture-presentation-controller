@@ -396,7 +396,6 @@ def pointer_drawing_overlay(
         _draw_stroke(drawing_state, pt,
                      smoothing_window=smoothing_window,
                      use_dead_zone=not pre_smoothed)
-        frame = _composite_canvas(drawing_state, frame)
         _draw_crosshair(frame, pt, CFG.draw_color)
         frame = _draw_mode_badge(
             frame, gesture,

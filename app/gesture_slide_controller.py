@@ -6,6 +6,7 @@ import sys
 import os
 import json
 import mediapipe as mp
+import threading
 import numpy as np
 from functools import lru_cache
 from pathlib import Path
@@ -23,7 +24,7 @@ HAND_LANDMARKER_PATH = Path(__file__).resolve().parent.parent / "training" / "mo
 GESTURE_MODEL_PATH   = Path(__file__).resolve().parent.parent / "training" / "artifacts" / "keras_model.keras"
 LABELS_PATH          = Path(__file__).resolve().parent.parent / "training" / "artifacts" / "labels.json"
 
-PREDICTION_COOLDOWN    = 0.6
+PREDICTION_COOLDOWN    = 0.9
 SWIPE_COOLDOWN         = 1.0
 GESTURE_MIN_CONFIDENCE = 0.55
 MODE_HOLD_SECONDS      = 3.0
@@ -37,7 +38,7 @@ PINCH_CLOSE_THRESH  = 0.2
 PINCH_OPEN_THRESH   = 0.3
 
 # ── Zoom constants ────────────────────────────────────────────────────────
-ZOOM_SENSITIVITY    = 2.0
+ZOOM_SENSITIVITY    = 1.0
 ZOOM_MIN            = 1.0
 ZOOM_MAX            = 3.0
 
@@ -45,13 +46,13 @@ ZOOM_MAX            = 3.0
 # CURSOR_ALPHA: EMA weight applied to each new raw sample.
 #   Lower  → heavier smoothing, more lag   (try 0.12–0.18 for max stability)
 #   Higher → snappier tracking, more jitter (approach 1.0 to disable EMA)
-CURSOR_ALPHA = 0.25
+CURSOR_ALPHA = 0.3
 
 # CURSOR_SENSITIVITY: multiplier applied to the cursor's displacement from the
 # screen centre.  1.0 = cursor matches hand 1-to-1.  1.8 means a hand movement
 # of N px from centre registers as 1.8 × N px of cursor travel, so the cursor
 # reaches slide edges with smaller hand movements.
-CURSOR_SENSITIVITY = 1.8
+CURSOR_SENSITIVITY = 1.2
 
 # ── Gesture → mode mapping ────────────────────────────────────────────────
 MODE_BY_LABEL = {
@@ -103,6 +104,28 @@ def predict_gesture(hand_landmarks):
     preds  = model.predict(landmarks_to_features(hand_landmarks), verbose=0)[0]
     idx    = int(np.argmax(preds))
     return labels[idx], float(preds[idx])
+
+_prediction_result = {
+    "label": "none",
+    "confidence": 0.0,
+}
+
+_prediction_lock = threading.Lock()
+
+_prediction_running = False
+
+
+def _prediction_worker(hand_landmarks):
+    global _prediction_running
+
+    try:
+        label, conf = predict_gesture(hand_landmarks)
+
+        with _prediction_lock:
+            _prediction_result["label"] = label
+            _prediction_result["confidence"] = conf
+    finally:
+        _prediction_running = False
 
 SWIPE_MIN_VELOCITY = 18   # px per frame — add near the other constants
 
@@ -396,22 +419,25 @@ while True:
         cursor_px    = smoother.update(raw_x, raw_y, width, height)
 
         # ── Gesture prediction (throttled) ────────────────────────────────
-        if current_time - last_prediction_time > PREDICTION_COOLDOWN:
-            try:
-                predicted_label, confidence = predict_gesture(hand_landmarks)
-            except Exception as exc:
-                last_action_text  = f"Model error: {exc}"
-                predicted_label   = last_prediction_text
-                confidence        = last_prediction_confidence
-            else:
-                last_prediction_text       = predicted_label
-                last_prediction_confidence = confidence
-            finally:
-                last_prediction_time = current_time
-        else:
-            predicted_label = last_prediction_text
-            confidence      = last_prediction_confidence
+        if (
+            current_time - last_prediction_time > PREDICTION_COOLDOWN
+            and not _prediction_running
+        ):
+            last_prediction_time = current_time
+            _prediction_running = True
 
+            threading.Thread(
+                target=_prediction_worker,
+                args=(hand_landmarks,),
+                daemon=True,
+            ).start()
+
+        with _prediction_lock:
+            predicted_label = _prediction_result["label"]
+            confidence = _prediction_result["confidence"]
+
+        last_prediction_text = predicted_label
+        last_prediction_confidence = confidence
         # ── Swipe detection ───────────────────────────────────────────────
         # NAVIGATION mode : left/right → previous/next slide  (unchanged)
         # DRAWING mode    : left → undo last stroke, right → redo
@@ -581,7 +607,7 @@ while True:
         (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
     )
 
-    webcam_display = cv2.resize(frame, (1280, 720))
+    webcam_display = cv2.resize(frame, (640, 480))
     cv2.imshow("Gesture Webcam", webcam_display)
     cv2.imshow("Gesture Controlled Slides", slide)
 
