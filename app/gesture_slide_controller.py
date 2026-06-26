@@ -104,6 +104,7 @@ def predict_gesture(hand_landmarks):
     idx    = int(np.argmax(preds))
     return labels[idx], float(preds[idx])
 
+SWIPE_MIN_VELOCITY = 18   # px per frame — add near the other constants
 
 def detect_swipe(x_history: list[int]) -> str | None:
     if len(x_history) < SWIPE_HISTORY_LENGTH:
@@ -111,7 +112,12 @@ def detect_swipe(x_history: list[int]) -> str | None:
     movement = x_history[-1] - x_history[0]
     if abs(movement) < SWIPE_MIN_MOVEMENT:
         return None
+
     deltas = np.diff(np.array(x_history))
+    avg_velocity = abs(movement) / len(deltas)   # ← avg px/frame
+    if avg_velocity < SWIPE_MIN_VELOCITY:         # ← velocity gate
+        return None
+
     if movement > 0:
         consistent = np.count_nonzero(deltas >  SWIPE_MIN_STEP)
         direction  = "right"
@@ -283,6 +289,8 @@ zoom_ref_distance = None
 # Cursor smoother — single shared instance updated once per frame
 smoother = CursorSmoother()
 
+fps_last_time = time.time()
+fps_value     = 0.0
 
 def get_slide_state(idx: int) -> PointerDrawingState:
     if idx not in slide_annotation_states:
@@ -298,6 +306,9 @@ while True:
         break
 
     current_time      = time.time()
+    fps_raw   = 1.0 / max(current_time - fps_last_time, 1e-6)
+    fps_value = 0.1 * fps_raw + 0.9 * fps_value   # EMA, α = 0.1
+    fps_last_time = current_time
     frame_ts_ms       = int(current_time * 1000)
     time_since_swipe  = current_time - last_swipe_time
     swipe_remaining   = SWIPE_COOLDOWN - time_since_swipe
@@ -317,6 +328,8 @@ while True:
 
     # ── HUD overlays ──────────────────────────────────────────────────────
     slide_text = f"Slide {controller.get_slide_number()} / {controller.get_total_slides()}"
+    cv2.putText(slide, f"FPS: {fps_value:.1f}", (30, 300 if active_mode != "ZOOM" else 340), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+
     cv2.putText(slide, slide_text,
                 (30, 50),  cv2.FONT_HERSHEY_SIMPLEX, 1,   (0, 0, 255), 2)
     cv2.putText(slide,
