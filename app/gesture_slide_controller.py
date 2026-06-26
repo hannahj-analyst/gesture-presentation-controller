@@ -16,7 +16,9 @@ sys.path.append(
 )
 
 from utils.slide_controller import SlideController
-from pointer_drawing import PointerDrawingState, pointer_drawing_overlay, clear_canvas
+from pointer_drawing import (
+    PointerDrawingState, pointer_drawing_overlay,
+    clear_canvas, draw_exit_progress_bar)
 from training.preprocess import normalize_landmarks
 
 
@@ -24,10 +26,10 @@ HAND_LANDMARKER_PATH = Path(__file__).resolve().parent.parent / "training" / "mo
 GESTURE_MODEL_PATH   = Path(__file__).resolve().parent.parent / "training" / "artifacts" / "keras_model.keras"
 LABELS_PATH          = Path(__file__).resolve().parent.parent / "training" / "artifacts" / "labels.json"
 
-PREDICTION_COOLDOWN    = 0.9
+PREDICTION_COOLDOWN    = 1.5
 SWIPE_COOLDOWN         = 1.0
 GESTURE_MIN_CONFIDENCE = 0.55
-MODE_HOLD_SECONDS      = 3.0
+MODE_HOLD_SECONDS      = 2.0
 SWIPE_HISTORY_LENGTH   = 8
 SWIPE_MIN_MOVEMENT     = 60
 SWIPE_MIN_STEP         = 6
@@ -269,6 +271,20 @@ class CursorSmoother:
         self._sy   = None
         self._last = (0, 0)
 
+class ZoomSmoother:
+    def __init__(self, alpha=0.15):
+        self.alpha = alpha
+        self.value = 1.0
+
+    def update(self, target):
+        self.value = (
+            self.alpha * target
+            + (1 - self.alpha) * self.value
+        )
+        return self.value
+
+    def reset(self):
+        self.value = 1.0
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────
 options = HandLandmarkerOptions(
@@ -308,6 +324,9 @@ was_pinched  = False   # tracks the previous frame's pinch state
 # Zoom state
 zoom_level        = 1.0
 zoom_ref_distance = None
+zoom_smoother = ZoomSmoother(alpha=0.15)
+
+prev_slide_idx = -1   
 
 # Cursor smoother — single shared instance updated once per frame
 smoother = CursorSmoother()
@@ -317,7 +336,11 @@ fps_value     = 0.0
 
 def get_slide_state(idx: int) -> PointerDrawingState:
     if idx not in slide_annotation_states:
-        slide_annotation_states[idx] = PointerDrawingState()
+        state = PointerDrawingState()
+        slide = controller.get_current_slide()
+        slide = cv2.resize(slide, (900, 600))
+        state.set_base_slide(slide)
+        slide_annotation_states[idx] = state
     return slide_annotation_states[idx]
 
 
@@ -349,26 +372,24 @@ while True:
     current_slide_idx = controller.current_slide_index
     slide_state       = get_slide_state(current_slide_idx)
 
+    if current_slide_idx != prev_slide_idx:
+        if slide_state.working_slide is None:
+            slide_state.set_base_slide(slide)
+        prev_slide_idx = current_slide_idx
+
+    if slide_state.working_slide is not None:
+        slide = slide_state.working_slide.copy()
+
     # ── HUD overlays ──────────────────────────────────────────────────────
     slide_text = f"Slide {controller.get_slide_number()} / {controller.get_total_slides()}"
-    cv2.putText(slide, f"FPS: {fps_value:.1f}", (30, 300 if active_mode != "ZOOM" else 340), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
-
     cv2.putText(slide, slide_text,
                 (30, 50),  cv2.FONT_HERSHEY_SIMPLEX, 1,   (0, 0, 255), 2)
-    cv2.putText(slide,
-                f"Prediction: {last_prediction_text} ({last_prediction_confidence:.2f})",
-                (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.putText(slide, f"Action: {last_action_text}",
-                (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
 
     # Swipe status line — context-aware for DRAWING mode
     if active_mode == "DRAWING":
         swipe_txt = "Swipe: ← undo  → redo"
         swipe_clr = (0, 200, 140)
-    elif active_mode != "NAVIGATION":
-        exit_g    = MODE_EXIT_GESTURE_BY_MODE.get(active_mode, "")
-        swipe_txt = f"Swipe: LOCKED ({active_mode}) | hold {exit_g} 3s to exit"
-        swipe_clr = (0, 140, 255)
     elif swipe_on_cooldown:
         swipe_txt = f"Swipe: COOLDOWN ({swipe_remaining:.1f}s)"
         swipe_clr = (0, 0, 255)
@@ -378,12 +399,6 @@ while True:
 
     cv2.putText(slide, swipe_txt,
                 (30, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, swipe_clr, 2)
-    cv2.putText(slide, f"Mode: {active_mode}",
-                (30, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 120, 0), 2)
-
-    if active_mode == "ZOOM":
-        cv2.putText(slide, f"Zoom: {zoom_level:.2f}x",
-                    (30, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2)
 
     # ── Hand detection ────────────────────────────────────────────────────
     hand_landmarks = results.hand_landmarks[0] if results.hand_landmarks else None
@@ -515,6 +530,7 @@ while True:
                         last_action_text  = "Mode -> NAVIGATION"
                         zoom_level        = 1.0
                         zoom_ref_distance = None
+                        zoom_smoother.reset()
 
                 elif active_mode == "NAVIGATION":
                     if target_mode == "CLEAR":
@@ -526,7 +542,7 @@ while True:
                         if target_mode == "ZOOM":
                             zoom_level        = 1.0
                             zoom_ref_distance = None
-
+                            zoom_smoother.reset()
                 else:
                     if target_mode == "CLEAR":
                         clear_canvas(state=slide_state)
@@ -557,10 +573,15 @@ while True:
                     zoom_ref_distance = pinch_dist or 0.15
 
                 spread_ratio = pinch_dist / (zoom_ref_distance or 1e-6)
-                zoom_level   = float(np.clip(
+
+                target_zoom = float(np.clip(
                     spread_ratio * ZOOM_SENSITIVITY,
-                    ZOOM_MIN, ZOOM_MAX,
+                    ZOOM_MIN,
+                    ZOOM_MAX,
                 ))
+                if abs(target_zoom - zoom_level) < 0.02:
+                    target_zoom = zoom_level
+                zoom_level = zoom_smoother.update(target_zoom)
 
                 slide_h, slide_w = slide.shape[:2]
                 slide_cursor = (
@@ -595,18 +616,65 @@ while True:
         zoom_ref_distance = None
         smoother.reset()
 
-    # ── Persistent canvas composite (drawing mode, no hand) ───────────────
-    if (slide_state.canvas is not None
-            and not (active_mode in {"DRAWING"} and hand_landmarks is not None)):
-        slide = pointer_drawing_overlay(slide, None, "", slide_state)
+    if (
+        held_label_start > 0.0
+        and not held_label_fired
+        and active_mode == "NAVIGATION"
+    ):
+        progress = min(
+            (current_time - held_label_start) / MODE_HOLD_SECONDS,
+            1.0,
+        )
 
+        match held_label:
+            case "one":
+                slide = draw_exit_progress_bar(
+                    slide, progress, "Entering Pointer Mode..."
+                )
+
+            case "ok":
+                slide = draw_exit_progress_bar(
+                    slide, progress, "Entering Drawing Mode..."
+                )
+
+            case "peace":
+                slide = draw_exit_progress_bar(
+                    slide, progress, "Entering Zoom Mode..."
+                )
+
+
+    # ── Clear progress (available in ALL modes) ─────────────────────────
+    if (
+        held_label_start > 0.0
+        and not held_label_fired
+        and held_label == "stop"
+    ):
+        progress = min(
+            (current_time - held_label_start) / MODE_HOLD_SECONDS,
+            1.0,
+        )
+
+        slide = draw_exit_progress_bar(
+            slide, progress, "Clearing..."
+        )
+
+
+    # ── Exit progress (only from active modes) ──────────────────────────
+    if (
+        active_mode != "NAVIGATION"
+        and held_label == EXIT_GESTURE
+        and held_label_start > 0.0
+        and not held_label_fired
+    ):
+        progress = min(
+            (current_time - held_label_start) / MODE_HOLD_SECONDS,
+            1.0,
+        )
+
+        slide = draw_exit_progress_bar(
+            slide, progress, "Exiting..."
+        )
     # ── Webcam HUD ────────────────────────────────────────────────────────
-    cv2.putText(
-        frame,
-        "NAV: hold ok=Draw, peace=Zoom, stop=Clear | hold fist 3s to exit | q=Quit",
-        (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
-    )
-
     webcam_display = cv2.resize(frame, (640, 480))
     cv2.imshow("Gesture Webcam", webcam_display)
     cv2.imshow("Gesture Controlled Slides", slide)

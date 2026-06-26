@@ -13,12 +13,29 @@ Public API used by app/main.py:
   overlay = pointer_drawing_overlay(frame, landmarks, gesture, state,
                                     cursor_px=None)
   clear_canvas(width, height, state)  ← call when CLEAR gesture fires
+  state.set_base_slide(slide)         ← call on every slide change
+
+Architecture (baked-slide model)
+---------------------------------
+Instead of maintaining a separate BGRA canvas and alpha-compositing it onto
+the slide every frame, drawings are baked directly onto a BGR working_slide:
+
+  original_slide  – immutable copy of the slide as it was when set_base_slide()
+                    was last called.  Never drawn on.
+  working_slide   – original_slide with all *committed* strokes permanently
+                    rendered in.  This is what gets displayed most frames.
+  live_stroke_pts – list of (x, y) points for the stroke currently being drawn
+                    (pinch held but not yet released).  Each frame during a
+                    pinch this is replayed on a working_slide.copy() so the
+                    cursor frame is clean.  On commit (pinch release / undo
+                    trigger) the pts are baked into working_slide permanently.
 
 Undo / redo
 -----------
-Each completed pinch stroke is committed to an undo stack as a full canvas
-snapshot.  Swipe-left in DRAWING mode calls state.undo(), swipe-right calls
-state.redo().  Clearing the canvas is also undoable.
+Each completed pinch stroke is committed to an undo stack as a full
+working_slide snapshot.  Swipe-left in DRAWING mode calls state.undo(),
+swipe-right calls state.redo().  Clearing the canvas is also undoable.
+The snapshot is taken *before* the stroke, so undo restores pre-stroke state.
 
 Smoothing note
 --------------
@@ -56,9 +73,6 @@ class PointerConfig:
     # overridden to 1 inside pointer_drawing_overlay to avoid double-smoothing.
     draw_smoothing: int  = 5
 
-    # Canvas fade (seconds before strokes fade; 0 = permanent)
-    fade_seconds: float = 0.0
-
     # Dead-zone radius in px — suppresses micro-jitter when using raw landmarks.
     # Bypassed automatically when a pre-smoothed cursor_px is supplied.
     dead_zone_px: int = 6
@@ -71,50 +85,102 @@ CFG = PointerConfig()
 
 @dataclass
 class PointerDrawingState:
-    canvas: Optional[np.ndarray] = None        # BGRA, same HxW as frame
-    prev_draw_pt: Optional[tuple] = None
-    history: list = field(default_factory=list) # smoothing ring buffer
+    # ── Baked-slide storage ────────────────────────────────────────────── #
+    # original_slide: BGR copy of the slide at the time of the last
+    #   set_base_slide() call.  Never mutated.  Used by clear() to reset.
+    original_slide: Optional[np.ndarray] = None
+
+    # working_slide: original_slide with all *committed* strokes baked in.
+    #   Displayed as-is on frames where no live stroke is being drawn.
+    working_slide: Optional[np.ndarray] = None
+
+    # live_stroke_pts: (x, y) points collected during the current pinch.
+    #   Replayed on top of working_slide each frame for real-time feedback.
+    #   Cleared and baked into working_slide on commit.
+    live_stroke_pts: list = field(default_factory=list)
+
+    # ── Shared helpers ─────────────────────────────────────────────────── #
+    history: list = field(default_factory=list)   # smoothing ring buffer
     last_gesture: str = ""
 
-    # Undo / redo stacks — each entry is a full BGRA canvas snapshot.
-    # undo_stack[-1] is the state just before the most recent committed stroke.
-    # redo_stack[-1] is the state that was undone most recently.
+    # ── Undo / redo stacks ─────────────────────────────────────────────── #
+    # Each entry is a BGR working_slide snapshot (before the committed stroke).
     undo_stack: list = field(default_factory=list)
     redo_stack: list = field(default_factory=list)
 
-    def ensure_canvas(self, h: int, w: int) -> None:
-        if self.canvas is None or self.canvas.shape[:2] != (h, w):
-            self.canvas = np.zeros((h, w, 4), dtype=np.uint8)
+    # ── Slide initialisation ───────────────────────────────────────────── #
+
+    def set_base_slide(self, slide: np.ndarray) -> None:
+        """
+        Call whenever the displayed slide changes (new slide index, resize, etc.).
+
+        Saves an immutable copy as original_slide and resets working_slide to
+        match it.  Existing undo/redo history is cleared because it refers to
+        a different slide's pixel data.
+
+        main.py should call this once after:
+          • Loading / switching slides
+          • Resizing the slide image
+
+        It does NOT need to be called every frame.
+        """
+        self.original_slide = slide.copy()
+        self.working_slide  = slide.copy()
+        self.live_stroke_pts.clear()
+        self.history.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
+    def ensure_slide(self, h: int, w: int) -> None:
+        """
+        Fallback initialisation: if set_base_slide() was never called, create
+        a black working_slide at the requested size.  Preserves backward
+        compatibility for callers that don't call set_base_slide() explicitly.
+        """
+        if self.working_slide is None or self.working_slide.shape[:2] != (h, w):
+            blank = np.zeros((h, w, 3), dtype=np.uint8)
+            self.original_slide = blank
+            self.working_slide  = blank.copy()
+            self.live_stroke_pts.clear()
 
     # ── Undo / redo primitives ─────────────────────────────────────────── #
 
     def _push_undo(self) -> None:
-        """Snapshot current canvas onto the undo stack (bounded)."""
-        if self.canvas is not None:
-            self.undo_stack.append(self.canvas.copy())
+        """Snapshot current working_slide onto the undo stack (bounded)."""
+        if self.working_slide is not None:
+            self.undo_stack.append(self.working_slide.copy())
             if len(self.undo_stack) > MAX_UNDO_STEPS:
                 self.undo_stack.pop(0)
 
     def commit_stroke(self) -> None:
         """
         Call on pinch release (drawing stroke finished).
-        Saves a pre-stroke snapshot so undo restores to before that stroke.
-        Any pending redo history is discarded — a new stroke forks the timeline.
+
+        1. Saves a pre-stroke snapshot (the current working_slide before the
+           new stroke) so undo can restore to exactly before this stroke.
+        2. Bakes live_stroke_pts permanently into working_slide.
+        3. Clears live_stroke_pts.
+        4. Discards redo history — a new stroke forks the timeline.
         """
+        if not self.live_stroke_pts:
+            return                      # nothing to commit
+
         self._push_undo()
         self.redo_stack.clear()
+        self._bake_live_stroke(self.working_slide)
+        self.live_stroke_pts.clear()
 
     def undo(self) -> bool:
         """
-        Restore the canvas to the state before the last committed stroke.
+        Restore working_slide to the state before the last committed stroke.
         Returns True if an undo was available, False if the stack was empty.
         """
         if not self.undo_stack:
             return False
-        if self.canvas is not None:
-            self.redo_stack.append(self.canvas.copy())
-        self.canvas = self.undo_stack.pop()
-        self.prev_draw_pt = None   # break any in-progress stroke
+        if self.working_slide is not None:
+            self.redo_stack.append(self.working_slide.copy())
+        self.working_slide     = self.undo_stack.pop()
+        self.live_stroke_pts.clear()
         return True
 
     def redo(self) -> bool:
@@ -124,26 +190,82 @@ class PointerDrawingState:
         """
         if not self.redo_stack:
             return False
-        if self.canvas is not None:
-            self.undo_stack.append(self.canvas.copy())
-        self.canvas = self.redo_stack.pop()
-        self.prev_draw_pt = None
+        if self.working_slide is not None:
+            self.undo_stack.append(self.working_slide.copy())
+        self.working_slide     = self.redo_stack.pop()
+        self.live_stroke_pts.clear()
         return True
 
     # ── Canvas management ──────────────────────────────────────────────── #
 
     def clear(self) -> None:
-        """Wipe canvas.  The pre-clear state is pushed to the undo stack."""
+        """
+        Reset working_slide back to original_slide (wipes all annotations).
+        The pre-clear state is pushed to the undo stack so this is undoable.
+        """
         self._push_undo()
         self.redo_stack.clear()
-        if self.canvas is not None:
-            self.canvas[:] = 0
-        self.prev_draw_pt = None
+        if self.original_slide is not None:
+            self.working_slide = self.original_slide.copy()
+        elif self.working_slide is not None:
+            self.working_slide[:] = 0
+        self.live_stroke_pts.clear()
         self.history.clear()
 
     def reset_stroke(self) -> None:
-        """Call when leaving DRAWING mode to break the stroke without committing."""
-        self.prev_draw_pt = None
+        """
+        Call when leaving DRAWING mode to discard any in-progress stroke
+        without committing it.  Does NOT touch the undo stack.
+        """
+        self.live_stroke_pts.clear()
+
+    # ── Live-stroke rendering ──────────────────────────────────────────── #
+
+    def _bake_live_stroke(self, target: np.ndarray) -> None:
+        """
+        Render self.live_stroke_pts as a polyline onto `target` in-place.
+        `target` is typically self.working_slide (commit) or a temp copy
+        (per-frame preview).
+        """
+        if len(self.live_stroke_pts) < 2:
+            # A single point: draw a filled circle so even a tap is visible.
+            if self.live_stroke_pts:
+                cv2.circle(
+                    target,
+                    self.live_stroke_pts[0],
+                    CFG.draw_thickness // 2,
+                    CFG.draw_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+            return
+
+        pts = np.array(self.live_stroke_pts, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(
+            target,
+            [pts],
+            isClosed=False,
+            color=CFG.draw_color,
+            thickness=CFG.draw_thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+    def get_display_slide(self) -> Optional[np.ndarray]:
+        """
+        Return the frame-ready BGR slide:
+          • If a live stroke is in progress, overlay it on a copy of
+            working_slide (no mutation).
+          • Otherwise return working_slide directly (zero-copy fast path).
+        """
+        if self.working_slide is None:
+            return None
+
+        if self.live_stroke_pts:
+            display = self.working_slide.copy()
+            self._bake_live_stroke(display)
+            return display
+
+        return self.working_slide          # no copy needed
 
 
 _DEFAULT_STATE = PointerDrawingState()
@@ -192,35 +314,24 @@ def _index_fingertip(landmarks, frame_w: int, frame_h: int) -> Optional[tuple]:
     return (x, y)
 
 
-# ─────────────────────────── Drawing on canvas ────────────────────────────── #
+# ─────────────────────────── Accumulate live stroke ───────────────────────── #
 
-def _draw_stroke(state: PointerDrawingState, pt: tuple,
-                 smoothing_window: int, use_dead_zone: bool) -> None:
+def _accumulate_stroke_point(state: PointerDrawingState, pt: tuple,
+                              smoothing_window: int, use_dead_zone: bool) -> None:
     """
-    Add a point to the persistent drawing canvas.
+    Smooth `pt` and append to state.live_stroke_pts when outside the dead zone.
 
     Parameters
     ----------
-    smoothing_window : pass 1 to skip internal rolling average (when the
-                       cursor is already EMA-smoothed upstream).
+    smoothing_window : pass 1 to skip rolling average (cursor already EMA-
+                       smoothed upstream).
     use_dead_zone    : pass False to skip the dead-zone check (same reason).
     """
-    if state.canvas is None:
-        return
-
     smooth_pt = _smooth_point(state, pt, smoothing_window)
 
-    if (not use_dead_zone) or _outside_dead_zone(smooth_pt, state.prev_draw_pt, CFG.dead_zone_px):
-        if state.prev_draw_pt is not None:
-            cv2.line(
-                state.canvas,
-                state.prev_draw_pt,
-                smooth_pt,
-                (*CFG.draw_color, 255),
-                CFG.draw_thickness,
-                lineType=cv2.LINE_AA,
-            )
-        state.prev_draw_pt = smooth_pt
+    prev = state.live_stroke_pts[-1] if state.live_stroke_pts else None
+    if (not use_dead_zone) or _outside_dead_zone(smooth_pt, prev, CFG.dead_zone_px):
+        state.live_stroke_pts.append(smooth_pt)
 
 
 # ─────────────────────────── Laser pointer ────────────────────────────────── #
@@ -236,58 +347,49 @@ def _render_laser(frame: np.ndarray, pt: tuple) -> np.ndarray:
     return out
 
 
-# ─────────────────────────── Canvas composite ─────────────────────────────── #
-
-def _composite_canvas(state: PointerDrawingState, frame: np.ndarray) -> np.ndarray:
-    """Alpha-blend the persistent drawing canvas onto the frame."""
-    if state.canvas is None or not np.any(state.canvas[:, :, 3]):
-        return frame
-
-    canvas_bgr = state.canvas[:, :, :3]
-    alpha      = state.canvas[:, :, 3:4].astype(np.float32) / 255.0
-
-    out = frame.astype(np.float32)
-    out = out * (1.0 - alpha) + canvas_bgr.astype(np.float32) * alpha
-    return out.astype(np.uint8)
-
-
 # ─────────────────────────── HUD overlays ─────────────────────────────────── #
-
-def _draw_mode_badge(frame: np.ndarray, gesture: str,
-                     undo_count: int = 0, redo_count: int = 0) -> np.ndarray:
+def draw_exit_progress_bar(frame: np.ndarray, progress: float, label: str) -> np.ndarray:
     """
-    Small semi-transparent badge in the top-right corner.
-    In DRAWING mode the badge also shows undo/redo depth.
+    Render a semi-transparent 'Exiting...' progress bar at the bottom of the
+    frame.  `progress` is a float in [0.0, 1.0] representing hold completion.
     """
-    labels = {
-        "POINTER": ("● LASER", (0, 0, 200)),
-        "DRAWING": ("✏ DRAW",  (0, 180, 80)),
-        "CLEAR":   ("⊘ CLEAR", (0, 160, 220)),
-    }
-    if gesture not in labels:
-        return frame
-
-    base_text, color = labels[gesture]
-    if gesture == "DRAWING" and (undo_count or redo_count):
-        text = f"{base_text}  undo:{undo_count}  redo:{redo_count}"
-    else:
-        text = base_text
-
     h, w = frame.shape[:2]
-    font       = cv2.FONT_HERSHEY_DUPLEX
-    font_scale = 0.65
-    thickness  = 1
-    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-    pad = 8
-    x1, y1 = w - tw - pad * 2 - 10, 10
-    x2, y2 = w - 10, 10 + th + pad * 2
 
-    badge = frame.copy()
-    cv2.rectangle(badge, (x1, y1), (x2, y2), (20, 20, 20), -1, cv2.LINE_AA)
-    cv2.addWeighted(badge, 0.55, frame, 0.45, 0, frame)
-    cv2.putText(frame, text, (x1 + pad, y2 - pad),
-                font, font_scale, color, thickness, cv2.LINE_AA)
+    bar_h      = 36
+    bar_w      = 320
+    x1         = (w - bar_w) // 2
+    y1         = h - bar_h - 16
+    x2         = x1 + bar_w
+    y2         = y1 + bar_h
+    fill_x2    = x1 + int(bar_w * progress)
+    corner_r   = 8
+
+    # Background pill
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    # Filled progress region (amber → red as it fills)
+    r = int(50  + 205 * progress)
+    g = int(180 - 180 * progress)
+    b = 0
+    cv2.rectangle(frame, (x1, y1), (fill_x2, y2), (b, g, r), -1)
+
+    # Border
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (160, 160, 160), 1, cv2.LINE_AA)
+
+    # Label
+    font       = cv2.FONT_HERSHEY_DUPLEX
+    font_scale = 0.6
+    thickness  = 1
+    (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+    tx = (w - tw) // 2
+    ty = y1 + (bar_h + th) // 2
+    cv2.putText(frame, label, (tx, ty), font, font_scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
+
     return frame
+
 
 
 def _draw_crosshair(frame: np.ndarray, pt: tuple, color: tuple) -> None:
@@ -304,21 +406,14 @@ def _draw_crosshair(frame: np.ndarray, pt: tuple, color: tuple) -> None:
 def clear_canvas(width: int = 0, height: int = 0,
                  state: Optional[PointerDrawingState] = None) -> None:
     """
-    Wipe all drawing strokes.  The pre-clear state is pushed to the undo stack
-    so the clear itself can be undone with a swipe-left.
-    width / height are optional; if omitted the existing canvas is zeroed.
+    Wipe all drawing strokes, restoring working_slide to original_slide.
+    The pre-clear state is pushed to the undo stack so the clear is undoable.
+
+    width / height are accepted for backward compatibility but ignored —
+    the slide dimensions are already known from set_base_slide().
     """
     drawing_state = _resolve_state(state)
-    if width and height:
-        # Re-create canvas at the requested size — but first snapshot the old
-        # one so undo works even across a resize.
-        drawing_state._push_undo()
-        drawing_state.redo_stack.clear()
-        drawing_state.canvas = np.zeros((height, width, 4), dtype=np.uint8)
-        drawing_state.prev_draw_pt = None
-        drawing_state.history.clear()
-    else:
-        drawing_state.clear()
+    drawing_state.clear()
 
 
 def pointer_drawing_overlay(
@@ -334,7 +429,11 @@ def pointer_drawing_overlay(
 
     Parameters
     ----------
-    frame     : BGR frame (OpenCV / MediaPipe already drawn on it).
+    frame     : BGR slide frame that will be annotated and returned.
+                In the baked-slide model this is typically the raw slide
+                image (before HUD text is composited), but the function
+                works regardless — it starts from the slide's working_slide
+                or falls back to `frame` if set_base_slide() was not called.
     landmarks : MediaPipe hand landmarks for the detected hand, or None.
     gesture   : "POINTER" | "DRAWING" | "CLEAR" | anything else.
     state     : Per-slide PointerDrawingState; uses a module-level default
@@ -342,65 +441,83 @@ def pointer_drawing_overlay(
     cursor_px : Optional pre-smoothed fingertip position (x, y) in frame
                 pixel coordinates, supplied by main.py's CursorSmoother.
                 When provided:
-                  • _index_fingertip() is NOT called (raw landmark ignored
-                    for cursor position).
-                  • Internal rolling-average window is set to 1 (identity)
-                    to avoid adding lag on top of the upstream EMA.
-                  • Dead-zone check is skipped (EMA already killed micro-jitter).
-                When None the original behaviour is preserved: the raw
-                landmark is extracted and the rolling average + dead-zone
-                apply normally.
+                  • _index_fingertip() is NOT called.
+                  • Internal rolling-average window is set to 1 (identity).
+                  • Dead-zone check is skipped.
+                When None the original behaviour is preserved.
 
     Returns
     -------
     frame : BGR frame with pointer / drawing annotations composited on top.
+            In DRAWING mode this is get_display_slide() (working_slide with
+            the live stroke overlaid) plus the crosshair and HUD badge.
+            In POINTER mode this is the working_slide with a laser dot.
+            The HUD text written by main.py is NOT included here and should
+            be added after this call returns.
+
+    Notes
+    -----
+    The caller is responsible for calling state.set_base_slide(slide) once
+    whenever the displayed slide changes, and state.commit_stroke() on pinch
+    release.  pointer_drawing_overlay() accumulates live_stroke_pts during a
+    DRAWING frame but never commits them itself.
     """
     drawing_state = _resolve_state(state)
     h, w = frame.shape[:2]
-    drawing_state.ensure_canvas(h, w)
+    drawing_state.ensure_slide(h, w)
 
     pre_smoothed: bool = cursor_px is not None
 
-    # Break drawing stroke if gesture changed away from DRAWING
+    # ── Break drawing stroke if gesture changed away from DRAWING ──────── #
     if gesture != "DRAWING" and drawing_state.last_gesture == "DRAWING":
-        drawing_state.reset_stroke()
+        drawing_state.commit_stroke()
     drawing_state.last_gesture = gesture
 
-    # ── CLEAR ────────────────────────────────────────────────────────────── #
+    # ── CLEAR ─────────────────────────────────────────────────────────── #
     if gesture == "CLEAR":
         drawing_state.clear()
-        frame = _draw_mode_badge(frame, gesture)
-        return frame
+        out = drawing_state.get_display_slide() or frame
+        return out
 
-    # ── Resolve cursor position ───────────────────────────────────────────── #
+    # ── Start from baked working_slide (with live stroke if any) ─────── #
+    # This replaces the old _composite_canvas() call.  For most frames the
+    # fast path is taken: no copy, no alpha multiply — just use working_slide.
+    out = drawing_state.get_display_slide()
+
+    if out is None:
+        out = frame.copy()
+    else:
+        # Always copy while drawing so temporary overlays
+        # (crosshair, badge, etc.) aren't baked into working_slide.
+        if gesture == "DRAWING":
+            out = out.copy()
+        else:
+            out = out.copy()
+
+    # ── Resolve cursor position ───────────────────────────────────────── #
     if pre_smoothed:
         pt = cursor_px
     else:
         pt = _index_fingertip(landmarks, w, h)
 
-    # ── Composite persistent drawing (always visible) ─────────────────────── #
-    frame = _composite_canvas(drawing_state, frame)
-
     if pt is None:
-        return frame
+        return out
 
-    # ── LASER POINTER ─────────────────────────────────────────────────────── #
+    # ── LASER POINTER ─────────────────────────────────────────────────── #
     if gesture == "POINTER":
         drawing_state.history.clear()
-        frame = _render_laser(frame, pt)
-        frame = _draw_mode_badge(frame, gesture)
+        out = _render_laser(out, pt)
 
-    # ── DRAWING ───────────────────────────────────────────────────────────── #
+    # ── DRAWING ───────────────────────────────────────────────────────── #
     elif gesture == "DRAWING":
         smoothing_window = 1 if pre_smoothed else CFG.draw_smoothing
-        _draw_stroke(drawing_state, pt,
-                     smoothing_window=smoothing_window,
-                     use_dead_zone=not pre_smoothed)
-        _draw_crosshair(frame, pt, CFG.draw_color)
-        frame = _draw_mode_badge(
-            frame, gesture,
-            undo_count=len(drawing_state.undo_stack),
-            redo_count=len(drawing_state.redo_stack),
+        _accumulate_stroke_point(
+            drawing_state, pt,
+            smoothing_window=smoothing_window,
+            use_dead_zone=not pre_smoothed,
         )
+        # out already includes the live stroke via get_display_slide().
+        # We only need to add the crosshair cursor and HUD badge on top.
+        _draw_crosshair(out, pt, CFG.draw_color)
 
-    return frame
+    return out
