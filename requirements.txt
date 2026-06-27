@@ -1,5 +1,5 @@
 opencv-python
-mediapipe
+mediapipe==0.10.9
 numpy
 pandas
 matplotlib
@@ -7,6 +7,7 @@ seaborn
 scikit-learn
 pillow
 streamlit
-protobuf
+protobuf==3.20.3
 tensorflow
 tensorflowjs
+tqdm
