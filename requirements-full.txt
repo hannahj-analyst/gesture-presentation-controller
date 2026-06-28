@@ -1,0 +1,13 @@
+opencv-python
+mediapipe==0.10.35
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+pillow
+streamlit
+protobuf==3.20.3
+tensorflow
+tensorflowjs
+tqdm
