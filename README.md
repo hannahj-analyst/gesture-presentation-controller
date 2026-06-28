@@ -1,99 +1,40 @@
 # Gesture-Based Presentation Controller
 
-A computer vision application that controls presentation slides using hand gestures through a webcam. The system uses OpenCV for webcam and slide display, MediaPipe for hand landmark detection, and a custom-trained Keras gesture recognition model for static hand gesture classification.
+This project lets a presenter control slides with hand gestures instead of a mouse or keyboard.
 
-## Project Overview
+## Project Idea
 
-The Gesture-Based Presentation Controller allows a presenter to control slides without using a keyboard, mouse, or physical clicker. The webcam captures the presenter's hand movements and gestures in real time. The system then processes the video feed, detects hand landmarks, recognizes gestures, and maps those gestures to presentation actions.
+The system uses:
 
-The application supports slide navigation, pointer mode, drawing mode, annotation clearing, zoom mode, and gesture-based mode switching.
+- OpenCV for the live camera controller
+- MediaPipe for hand landmark detection
+- a custom Keras model for gesture recognition
+- Streamlit for the presentation dashboard
 
-## Features
+## Gesture Mapping
 
-* Swipe right → next slide
-* Swipe left → previous slide
-* Hand tracking using MediaPipe
-* Gesture-controlled slide navigation
-* Hold `one` for 2 seconds → pointer mode
-* Hold `ok` for 2 seconds → drawing mode
-* Hold `peace` for 2 seconds → zoom mode
-* Hold `stop` for 2 seconds → clear annotations
-* Hold `fist` for 2 seconds → exit active mode
-* Drawing mode supports undo and redo using swipe gestures
-* OpenCV-based webcam and slide display
-* Custom-trained gesture recognition model
-* Model evaluation metrics and confusion matrix included
+- Swipe right -> next slide
+- Swipe left -> previous slide
+- One finger -> pointer mode
+- Two fingers -> drawing mode
+- Open palm -> clear annotations
+- Zoom gesture -> zoom in or out
 
-## Technologies Used
-
-* Python
-* OpenCV
-* MediaPipe
-* TensorFlow / Keras
-* NumPy
-* Pandas
-* Scikit-learn
-* Matplotlib
-* Seaborn
-* Streamlit
-
-## Computer Vision Capabilities
-
-This project integrates multiple computer vision tasks:
-
-1. Real-time video processing using webcam input
-2. Hand landmark detection using MediaPipe
-3. Hand tracking across frames
-4. Motion-based swipe detection
-5. Static gesture recognition using a custom-trained Keras model
-6. Pointer and drawing interaction using fingertip position
-7. Zoom interaction using hand landmark distance
-
-## Current Progress
-
-✅ Webcam input and OpenCV frame processing
-✅ MediaPipe hand landmark detection
-✅ Swipe-based slide navigation
-✅ Slide controller
-✅ Trained custom gesture recognition model
-✅ Pointer mode
-✅ Drawing mode with undo/redo
-✅ Clear annotation gesture
-✅ Zoom mode
-✅ Model evaluation metrics and confusion matrix
-
-## Folder Structure
+## Repository Layout
 
 ```text
 gesture-presentation-controller/
   app/
     gesture_slide_controller.py
     main.py
-    test_slide_controller.py
+    streamlit_app.py
 
   assets/
     slides/
-      slide1.png
-      slide2.jpg
-      slide3.jpg
 
   training/
     artifacts/
-      keras_model.keras
-      labels.json
-      metadata.json
-      metrics.json
-      confusion_matrix.png
-      processed_landmarks.csv
-      tfjs_model/
-
     models/
-      hand_landmarker.task
-
-    constants.py
-    preprocess.py
-    train.py
-    README.md
 
   utils/
     slide_controller.py
@@ -104,119 +45,39 @@ gesture-presentation-controller/
   README.md
 ```
 
-## How to Run
+## How To Run
 
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/joel-cdev/gesture-presentation-controller.git
-cd gesture-presentation-controller
-```
-
-### 2. Create and activate a virtual environment
+### 1. Install the dashboard dependencies
 
 ```bash
-py -3.11 -m venv .venv
-.\.venv\Scripts\activate
-```
-
-### 3. Install dependencies
-
-```bash
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### 4. Run the application
+This installs the lightweight Streamlit dashboard only.
+
+### 2. Run the Streamlit dashboard
 
 ```bash
-python app\gesture_slide_controller.py
+python -m streamlit run app/streamlit_app.py
 ```
 
-Two windows should open:
+The dashboard shows the slides, project info, and a button to launch the live controller.
 
-* Gesture Webcam
-* Gesture Controlled Slides
+### 3. Run the live OpenCV controller
 
-## Controls
+For the webcam controller and MediaPipe-based gesture runtime, use Python 3.12 and install the full stack:
 
-* Swipe right → next slide
-* Swipe left → previous slide
-* Hold `one` for 2 seconds → pointer mode
-* Hold `ok` for 2 seconds → drawing mode
-* Hold `peace` for 2 seconds → zoom mode
-* Hold `stop` for 2 seconds → clear annotations
-* Hold `fist` for 2 seconds → exit active mode
-* Press `q` → quit
-
-## Gesture Model
-
-The custom gesture recognition model is stored in:
-
-```text
-training/artifacts/keras_model.keras
+```bash
+python -m pip install -r requirements-full.txt
 ```
 
-The model uses 63 input features from MediaPipe hand landmarks:
-
-```text
-21 landmarks × 3 coordinates = 63 features
+```bash
+python app/gesture_slide_controller.py
 ```
-
-The trained gesture classes are:
-
-* one
-* peace
-* stop
-* ok
-* fist
-
-The class labels are stored in:
-
-```text
-training/artifacts/labels.json
-```
-
-## Model Results
-
-The trained model evaluation results are stored in:
-
-```text
-training/artifacts/metrics.json
-```
-
-The final model achieved approximately 94.63% test accuracy.
-
-The confusion matrix image is stored in:
-
-```text
-training/artifacts/confusion_matrix.png
-```
-
-## Training
-
-See the training documentation:
-
-```text
-training/README.md
-```
-
-The training pipeline extracts MediaPipe hand landmarks from labeled gesture images and trains a Keras neural network classifier.
 
 ## Notes
 
-For best performance:
-
-* Use good lighting.
-* Keep your hand clearly visible to the webcam.
-* Stand about 2–3 feet from the camera.
-* Use clear and steady gestures.
-* Avoid cluttered backgrounds when possible.
-
-## Repository
-
-GitHub Repository:
-
-```text
-https://github.com/joel-cdev/gesture-presentation-controller
-```
+- Put slide images in `assets/slides/`.
+- The Streamlit dashboard is the front-end view for the project.
+- The OpenCV controller is the part that actually reads the webcam and changes slides.
+- If `streamlit` is not recognized, run it with `python -m streamlit ...` instead of `streamlit ...`.
